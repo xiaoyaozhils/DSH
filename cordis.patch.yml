@@ -1,0 +1,123 @@
+# 书桌整合包（shuzhuo）——一个包带两样东西：
+#   1. 书桌本体插件：库概览 / 牵连扫描 / 页面邻居 / 待办 / 讨论台 / 入库
+#   2. 「写作模式」agent preset：面向文字工作者的写作会话组合（瘦身工具面，省 schema token）
+# 写库不是这个包干的活，走 Obsidian 侧插件 Whale Bridge（whale-obsidian-bridge）的本地 HTTP 桥。
+- insert:
+    - id: shuzhuo
+      name: '@local/shuzhuo'
+
+    # ── 写作模式 preset ──────────────────────────────────────────────
+    - id: preset-writing
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: writing
+        name: 写作模式
+        description: 面向文字工作者的写作会话：设定、正文、考据，读写 Obsidian 库。
+        order: 0
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                你是作者的写作搭档。这个模式只服务一件事：把作者脑子里的故事，变成落在纸面上的字。
+
+                【先看资料】作者的资料库、书桌配置和协作约定写在当前工作区的 AGENTS.md 里；开工前先读它。没写就去问作者：资料库绝对路径、书桌的 stateDir、Whale Bridge 的端口和 token。库的读写一律走 Obsidian 侧插件 Whale Bridge 的本地桥，不要用文件工具直接改库里的文件。
+
+                【写作准则】
+                - 设定是正本。要改已有设定，先说清楚改哪条、为什么、影响谁；作者没点头就不落库。新增设定优先并入已有页面，不另起同名页。
+                - 写正文就写字。作者问“这段怎么写”，就给能直接用的段落，不写“可以这样写……”的空话。
+                - 保留作者的原话、命名和比喻，你只做收紧和顺句，不换掉他的味道。
+                - 考据要真查。物候、生物、节气、地理这类细节不确定就查资料，宁可说不知道也不编。
+                - 一次别铺太长。先给 1-3 段看方向，作者说继续再往下展开。
+                - 书桌的草稿存在 stateDir 里，入库是书桌自己的程序，你负责查漏补缺。
+
+                【说话方式】中文，直接，像一个坐在对面的真人搭档。不用“作为 AI”开场，不写三段式总结，少用表格。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, and checks to ground the plan in the actual files. Do not edit or write files, change configuration, or otherwise carry out the plan.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
