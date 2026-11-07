@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Desk",
-    "description": "A shared writing desk for Xiaoyao and Jingjing: vault overview, knock-on scan, page neighbours, and a to-do list. Read-only on the Obsidian vault."
+    "description": "A writing workbench for DSH: vault overview, knock-on scan, page neighbours, a discussion desk, draft splitting into the inbox, open questions, and a to-do list. Reads your Obsidian vault live."
   }
 }

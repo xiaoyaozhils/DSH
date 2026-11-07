@@ -1,9 +1,9 @@
 {
   "name": "@local/shuzhuo",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
-  "description": "书桌：长文档写作者在 DSH 里的创作工作台——库概览、牵连扫描、页面邻居、讨论台、拆片入库、待办；附带一个「写作模式」会话预设。写库走 Obsidian 侧插件 Whale Bridge 的本地桥。",
+  "description": "书桌：长文档写作者在 DSH 里的创作工作台——库概览、牵连扫描、页面邻居、讨论台、拆片入库（先进待定箱）、待议留档、待办；附带一个「写作模式」会话预设。写库走 Obsidian 侧插件 Whale Bridge 的本地桥。",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

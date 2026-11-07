@@ -326,6 +326,20 @@ window.__ModuleLoader__.load({
       return http('GET', path)
     }
 
+    /**
+     * 书桌自己的位置（库、草稿、工作区）由宿主告诉前端，前端不再写死任何人的路径。
+     * 第一次读 /state 之后缓存住，叫助手和列会话都从这里取。
+     */
+    let deskState = null
+    async function loadDeskState() {
+      if (deskState !== null) return deskState
+      try {
+        const next = await getJson(API + '/state')
+        if (next?.ok === true) deskState = next
+      } catch { /* 读不到就按未配置处理 */ }
+      return deskState
+    }
+
     function remoteSession() {
       try {
         return panelCtx === null ? null : panelCtx.remote.session
@@ -403,11 +417,15 @@ window.__ModuleLoader__.load({
       const title = (typeof payload.title === 'string' && payload.title.trim() !== '')
         ? payload.title.trim()
         : '（还没有名字的一页）'
+      // 草稿在哪儿、工作区在哪儿都问宿主要，不再写死某个人的路径。
+      const desk = await loadDeskState()
+      const draftsPath = typeof desk?.paths?.drafts === 'string' ? desk.paths.drafts : ''
+      const workdir = typeof desk?.workdir === 'string' ? desk.workdir : ''
       const text = payload.filed === true
         ? '【书桌】「' + title + '」这页已经入库了（' + (payload.rel ?? '') + '），'
           + '帮我看看有没有漏的、要补的，跟库里别的设定有没有打架。'
         : '【书桌】「' + title + '」这页草稿写好了，帮我查漏补缺。'
-          + '草稿在 C:\\Users\\20868\\dsh-workspace\\书桌\\state\\drafts.json，'
+          + (draftsPath === '' ? '' : '草稿在 ' + draftsPath + '，')
           + '跟库里已有设定有没有打架也一起看看。'
       const signal = new AbortController().signal
       const target = readAskTarget()
@@ -415,7 +433,7 @@ window.__ModuleLoader__.load({
         const remote = remoteSession()
         if (remote !== undefined && remote !== null) {
           const norm = (value) => String(value ?? '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
-          const workdir = norm('C:\\Users\\20868\\dsh-workspace')
+          const here0 = workdir === '' ? '' : norm(workdir)
           let sessionId = null
           let created = false
           let how = 'current'
@@ -435,12 +453,14 @@ window.__ModuleLoader__.load({
             const rows = all
               .filter((item) => item.origin !== 'subagent' && item.parentSessionId === undefined && item.blank !== true)
               .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-            const here = rows.filter((item) => norm(item.cwd) === workdir)
-            const pick = here.length > 0 ? here[0] : (rows.length > 0 ? rows[0] : null)
+            const here = here0 === '' ? rows : rows.filter((item) => norm(item.cwd) === here0)
+            const pick = here.length > 0 ? here[0] : null
             sessionId = pick !== null ? pick.sessionId : null
           }
           if (sessionId === null) {
-            const made = await remote.create({ cwd: 'C:\\Users\\20868\\dsh-workspace', agentPreset: 'writing' })
+            const made = await remote.create(workdir === ''
+              ? { agentPreset: 'writing' }
+              : { cwd: workdir, agentPreset: 'writing' })
             sessionId = made?.value?.sessionId ?? made?.sessionId
             created = true
             how = target === 'new' ? 'created' : 'fallback'
@@ -799,7 +819,7 @@ window.__ModuleLoader__.load({
           h('input', {
             className: 'sz-input',
             value: terms,
-            placeholder: '要改的术语，逗号分隔：折枝，断口，临时屏障，太初源能',
+            placeholder: '要改的术语，逗号分隔：比如 主角名，某个地名，或一条核心设定',
             onChange: (event) => setTerms(event.target.value),
           }),
           h('button', { className: 'sz-btn', type: 'submit', disabled: busy },
@@ -988,10 +1008,17 @@ window.__ModuleLoader__.load({
       写作: '05-写作',
     }
     const TYPE_OPTIONS = ['人物', '事件', '设定', '世界', '素材', '写作', '故事']
+    /** 入库的落脚点：先进待定箱，助手过一遍再挪进正式分类。 */
+    const INBOX_DIR = '08-待定/00-新入库'
 
     const STATUS_TEXT = { draft: '讨论中', settled: '待入库', filed: '已入库' }
 
     /** 老存档里没有 related 这些字段，统一补齐，免得读的时候到处判空。 */
+    /** 字符串数组的兜底：盘上可能是 undefined、也可能被手改坏。 */
+    function asStringList(value) {
+      return Array.isArray(value) ? value.filter((one) => typeof one === 'string' && one.trim() !== '') : []
+    }
+
     function normalizeDraft(item) {
       const text = (value) => (typeof value === 'string' ? value : '')
       return {
@@ -1002,6 +1029,7 @@ window.__ModuleLoader__.load({
         body: text(item.body),
         category: text(item.category) === '' ? '设定' : item.category,
         aliases: Array.isArray(item.aliases) ? item.aliases.filter((a) => typeof a === 'string') : [],
+        issues: asStringList(item.issues),
       }
     }
 
@@ -1031,6 +1059,25 @@ window.__ModuleLoader__.load({
       } catch { /* 存不了（隐私模式/满了）就只靠写盘 */ }
     }
 
+    /**
+     * 盘上那份和本地缓存合并，同一条按 updatedAt 取新的那一边。
+     *
+     * 2026-11-07：以前这里只有「盘上为空壳才用缓存」一条兜底，结果反过来——
+     * 缓存里是旧的（比如书桌早先猜的名字「下面只」），一刷新就盖回盘上，
+     * 助手改在 drafts.json 里的东西全被吃掉。现在谁新听谁的，且两边独有的条目不丢。
+     */
+    function mergeDrafts(serverItems, cached) {
+      const byId = new Map()
+      for (const item of cached ?? []) byId.set(item.id, item)
+      for (const item of serverItems ?? []) {
+        const local = byId.get(item.id)
+        const newer = local === undefined ? item
+          : (Number(local.updatedAt ?? 0) > Number(item.updatedAt ?? 0) ? local : item)
+        byId.set(item.id, newer)
+      }
+      return [...byId.values()].sort((a, b) => Number(b.updatedAt ?? b.at ?? 0) - Number(a.updatedAt ?? a.at ?? 0))
+    }
+
     // 名字、类别、别名这些，作者不擅长也不爱填 —— 他自己说的「交给你来判断」。
     // 所以讨论态只留两个框：跟什么有关、正文。其余在结算时由下面这几个函数先猜一份，
     // 猜错了在结算页改一下就行，猜对了就当没看见。
@@ -1039,14 +1086,26 @@ window.__ModuleLoader__.load({
       return head ?? ''
     }
 
+    /** 名字长得像不像专名：虚词开头、带助词标点的都不算（对应宿主那边同一套判断）。 */
+    const NAME_HEAD = /^(这|那|下|上|以|不|很|然|并|但|而|所|因|对|从|到|在|和|与|及|其|此|该|每|各|两|几|数|多|少|全|都|又|再|更|最|太|还|就|才|只|也|却|便|则|若|如|虽|即|且|或|可|能|要|会|把|被|给|让|使|为|着|了|过|是|有|没|无|说|讲|写|像|成|做|用|一)/
+    const NAME_BAD = /[的了着过嘛呢吧啊呀哦是有在把被给让使为吗\s，。、；：！？,.;:!?"'“”‘’「」『』《》（）()\[\]]/
+
+    function looksLikeName(value) {
+      const text = String(value ?? '').trim()
+      if (text.length < 2 || text.length > 14) return false
+      return !NAME_HEAD.test(text) && !NAME_BAD.test(text)
+    }
+
     function guessTitle(draft) {
-      // 正文开头「X 是……」最像真名：「折枝是万象之柢折下来的一段」→ 折枝。
-      const firstLine = draft.body.trim().split(/\n+/)[0] ?? ''
-      const asName = firstLine.match(/^([^\s，。、；：！？]{2,12})(?:是|指|即|就是)/)
-      if (asName !== null) return asName[1]
-      const fromRelated = firstPhrase(draft.related)
-      if (fromRelated.length >= 2) return fromRelated.slice(0, 20)
-      return firstLine.replace(/^#+\s*/, '').trim().slice(0, 20)
+      // 2026-11-07：「下面只是一些大概的想法」以前会被认成名字「下面只」。
+      // 宁可不猜：猜不出就留空，让作者自己填（结算页会要他给个名字）。
+      const body = draft.body.trim()
+      const firstLine = body.split(/\n+/)[0] ?? ''
+      const quoted = /[「『"“]([^」』"”]{2,14})[」』"”]/.exec(firstLine)
+      if (quoted !== null && looksLikeName(quoted[1])) return quoted[1]
+      const asName = /^([^\s，。、；：！？]{2,14})(?:是|指|即|就是|叫作|叫做)/.exec(firstLine)
+      if (asName !== null && looksLikeName(asName[1]) && body.split(asName[1]).length - 1 >= 2) return asName[1]
+      return ''
     }
 
     function guessCategory(draft) {
@@ -1057,14 +1116,24 @@ window.__ModuleLoader__.load({
       return '设定'
     }
 
-    /** 扫描用的词：标题 + 「和什么有关」里切出来的每个片段。 */
-    function guessTerms(draft) {
+    /** 扫描用的词：先问宿主从正文里认（库里的页名、书名号引号里的词），认不出再退回本地拼。 */
+    async function guessTerms(draft) {
+      try {
+        const res = await http('POST', API + '/terms', {
+          text: draft.body ?? '',
+          title: (draft.title ?? '').trim(),
+          related: draft.related ?? '',
+        })
+        if (res?.ok === true && Array.isArray(res.terms) && res.terms.length > 0) return res.terms
+      } catch {
+        /* 宿主没响应就往回退，别为了扫描词卡住整个结算 */
+      }
       const terms = new Set()
       const title = (draft.title.trim() !== '' ? draft.title : guessTitle(draft)).trim()
       if (title !== '') terms.add(title)
       draft.related.split(/[，,、;；:：。！？\s]+/).forEach((part) => {
         const value = part.trim()
-        if (value.length >= 2 && value.length <= 12) terms.add(value)
+        if (value.length >= 2 && value.length <= 10 && looksLikeName(value)) terms.add(value)
       })
       draft.aliases.forEach((alias) => {
         if (alias.trim() !== '') terms.add(alias.trim())
@@ -1089,7 +1158,9 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [note, setNote] = useState('')
       const [parts, setParts] = useState([])
+      const [issues, setIssues] = useState([])
       const [dirs, setDirs] = useState([])
+      const [termText, setTermText] = useState('')
       const [fileNote, setFileNote] = useState('')
       const saveTimer = useRef(0)
       const latestDrafts = useRef(drafts)
@@ -1101,6 +1172,7 @@ window.__ModuleLoader__.load({
         setNote('')
         setFileNote('')
         setParts([])
+        setIssues(Array.isArray(active?.issues) ? active.issues : [])
       }, [activeId])
 
       const flushDrafts = async () => {
@@ -1174,6 +1246,11 @@ window.__ModuleLoader__.load({
 
       const updatePart = (id, fields) => {
         putParts(parts.map((part) => (part.id === id ? { ...part, ...fields } : part)))
+        // 2026-11-07：只有一片时，在结算页给这页改的名字，同时写回草稿自己——
+        // 否则左边卡片的标题还是书桌早先猜的那个（比如「下面只」），改完名字两处对不上。
+        if (parts.length === 1 && typeof fields?.title === 'string' && fields.title.trim() !== '') {
+          patch({ title: fields.title.trim() })
+        }
       }
 
       const dropPart = (id) => {
@@ -1181,20 +1258,21 @@ window.__ModuleLoader__.load({
       }
 
       const swapType = (part, type) => {
-        const top = TYPE_TOP[type]
-        const keep = part.dir === top || part.dir.startsWith(top + '/')
-        const fallback = dirs.find((dir) => dir.path === top)?.path ?? part.dir
-        updatePart(part.id, { type, dir: keep ? part.dir : fallback })
+        // 2026-11-07：入库统一先进待定箱，换类型只换写法，不把去向跳回正式分类。
+        updatePart(part.id, { type })
       }
 
       const addPart = () => {
-        const top = TYPE_TOP['设定']
+        const inbox = dirs.find((dir) => dir.path === INBOX_DIR)?.path
+          ?? dirs.find((dir) => dir.name === '新入库')?.path
+          ?? dirs[0]?.path
+          ?? INBOX_DIR
         putParts([...parts, {
           id: 'p' + Date.now(),
           on: true,
           title: '',
           type: '设定',
-          dir: dirs.find((dir) => dir.path === top)?.path ?? (dirs[0]?.path ?? top),
+          dir: inbox,
           body: '',
         }])
       }
@@ -1217,7 +1295,8 @@ window.__ModuleLoader__.load({
           const kept = Array.isArray(active.parts) && active.parts.length > 0 && active.splitKey === key
             ? active.parts
             : null
-          const terms = guessTerms({ ...active, ...seed })
+          const terms = await guessTerms({ ...active, ...seed })
+          setTermText(terms.join('，'))
           const tasks = [getJson(API + '/probe?terms=' + encodeURIComponent(terms.join(','))).catch(() => null)]
           if (kept === null) {
             tasks.push(http('POST', API + '/split', {
@@ -1238,6 +1317,7 @@ window.__ModuleLoader__.load({
             title: part.title,
             type: part.type,
             dir: part.dir,
+            suggested: part.suggested,
             body: part.body,
           }))
           if (kept === null) {
@@ -1250,8 +1330,13 @@ window.__ModuleLoader__.load({
               /* 目录树拉不到就先按空列表走，part.dir 会作为自定义项显示 */
             }
           }
+          // 待议的条目挂回草稿：切回讨论、或者再结算一次，都不丢。
+          const nextIssues = kept === null
+            ? asStringList(splitRes.issues)
+            : asStringList(active.issues)
           setParts(nextParts)
-          patch({ ...seed, parts: nextParts, splitKey: key })
+          setIssues(nextIssues)
+          patch({ ...seed, parts: nextParts, splitKey: key, issues: nextIssues })
           if (probeRes?.ok === true) setScan(probeRes)
           else setScan(null)
           setFileNote('')
@@ -1379,7 +1464,11 @@ window.__ModuleLoader__.load({
               style: { flex: 1, fontSize: '13.5px' },
               value: part.dir,
               onChange: (event) => updatePart(part.id, { dir: event.target.value }),
-            }, dirOptions(part))),
+            }, dirOptions(part)),
+            typeof part.suggested === 'string' && part.suggested !== '' && part.suggested !== part.dir
+              ? h('span', { className: 'sz-split-hint', style: { marginLeft: '6px' } },
+                  '建议 ' + part.suggested)
+              : null),
           h('textarea', {
             className: 'sz-part-body',
             value: part.body,
@@ -1387,6 +1476,20 @@ window.__ModuleLoader__.load({
           }))
 
       // ── 结算：先拆片、各归各类，再写库 ───────────────────────────────
+      const rescan = async () => {
+        const list = termText.split(/[,，、\s]+/).map((one) => one.trim()).filter((one) => one !== '')
+        if (list.length === 0 || busy) return
+        setBusy(true)
+        try {
+          const next = await getJson(API + '/probe?terms=' + encodeURIComponent(list.join(',')))
+          setScan(next?.ok === true ? next : null)
+        } catch {
+          setScan(null)
+        } finally {
+          setBusy(false)
+        }
+      }
+
       if (mode === 'settle') {
         const reds = (scan?.items ?? []).filter((item) => item.level === 'red')
         const yellows = (scan?.items ?? []).filter((item) => item.level === 'yellow')
@@ -1418,7 +1521,21 @@ window.__ModuleLoader__.load({
                       '深度涉及 ' + (scan.counts?.yellow ?? 0)),
                     h('span', null, h('span', { className: 'sz-gdot', style: { background: LEVEL.gray.dot } }),
                       '顺带提及 ' + (scan.counts?.gray ?? 0))),
-                  reds.length === 0 ? null : h('div', null, ...reds.map(line)),
+                  h('div', { className: 'sz-scan', style: { margin: '10px 0 6px' } },
+                    h('input', {
+                      className: 'sz-input',
+                      value: termText,
+                      placeholder: '拿哪些词去搜，逗号分隔',
+                      onChange: (event) => setTermText(event.target.value),
+                    }),
+                    h('button', { className: 'sz-btn', type: 'button', onClick: () => { void rescan() }, disabled: busy },
+                      busy ? '扫描中…' : '重扫')),
+                  h('div', { className: 'sz-hint', style: { margin: '0 0 10px' } },
+                    '扫描词是从正文里认的：库里已有的页名、书名号引号里点名的词。认错了就改上面这行再重扫。'),
+                  (scan.items ?? []).length === 0
+                    ? h('div', { className: 'sz-empty' }, '这些词在库里没有落脚的地方——要么真是新东西，要么词没认对。')
+                    : h(Graph, { result: scan, openPage }),
+                  reds.length === 0 ? null : h('div', { style: { marginTop: '10px' } }, ...reds.map(line)),
                   yellows.length === 0 ? null : h('div', { style: { marginTop: '10px' } },
                     h('div', { className: 'sz-hint', style: { marginBottom: '4px' } }, '深度涉及（可能要一起改）'),
                     ...yellows.map(line)),
@@ -1434,10 +1551,17 @@ window.__ModuleLoader__.load({
                             onClick: () => openPage(item.rel),
                           }, item.name)),
                         '——写入时会追加成一节，不会覆盖。')),
+            issues.length === 0 ? null : h('div', { className: 'sz-card' },
+              h('h3', null, '留着要议的 ' + issues.length + ' 条'),
+              h('div', { className: 'sz-hint', style: { marginTop: '-2px' } },
+                '草稿里以「## 待议」开头、或以「问：」起行的那些，是问题不是内容——不进页面，留在讨论区等你们议。'),
+              ...issues.map((line, index) =>
+                h('div', { key: 'issue' + index, className: 'sz-note', style: { marginTop: '6px' } },
+                  '· ' + line))),
             h('div', { className: 'sz-card' },
               h('h3', null, '拆成 ' + parts.length + ' 片 · 各归各类'),
               h('div', { className: 'sz-hint', style: { marginTop: '-2px' } },
-                '一条新设定常常牵着好几处：人物归人物、事件归事件、设定归设定。核一下每片的标题和去向，不对就改。'),
+                '入库先进 08-待定/00-新入库，助手在库里过一遍、改顺了再挪进正式分类。这里核一下每片的标题和去向，不对就改。'),
               parts.length === 0
                 ? h('div', { className: 'sz-empty' }, '没能拆出内容——回去把正文写具体一点。')
                 : null,
@@ -1499,6 +1623,20 @@ window.__ModuleLoader__.load({
             placeholder: '具体内容。怎么想的就怎么写，这里没人打断。',
             onChange: (event) => patch({ body: event.target.value }),
           }),
+          issues.length === 0 ? null : h('div', { className: 'sz-card', style: { marginTop: '10px' } },
+            h('div', { className: 'sz-part-head' },
+              h('h3', { style: { margin: 0 } }, '留着要议的 ' + issues.length + ' 条'),
+              h('span', { style: { flex: 1 } }),
+              h('button', {
+                className: 'sz-btn',
+                style: { fontSize: '13px', padding: '4px 10px' },
+                onClick: () => { setIssues([]); patch({ issues: [] }) },
+              }, '议完了，清掉')),
+            h('div', { className: 'sz-hint', style: { marginTop: '4px' } },
+              '这些是问题不是内容，入库时没有写进页面。'),
+            ...issues.map((line, index) =>
+              h('div', { key: 'talk-issue' + index, className: 'sz-note', style: { marginTop: '6px' } },
+                '· ' + line))),
           h('div', { className: 'sz-desk-bar' },
             h('span', { className: 'sz-desk-quiet' },
               active.status === 'filed'
@@ -1560,10 +1698,11 @@ window.__ModuleLoader__.load({
             const listed = await remote.list({}, new AbortController().signal)
             const all = listed?.value?.items ?? listed?.items ?? []
             const norm = (value) => String(value ?? '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
-            const workdir = norm('C:\\Users\\20868\\dsh-workspace')
+            const desk = await loadDeskState()
+            const here0 = typeof desk?.workdir === 'string' && desk.workdir !== '' ? norm(desk.workdir) : ''
             const rows = all
               .filter((item) => item.origin !== 'subagent' && item.parentSessionId === undefined && item.blank !== true)
-              .filter((item) => norm(item.cwd) === workdir)
+              .filter((item) => here0 === '' || norm(item.cwd) === here0)
               .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
               .slice(0, 6)
             setSessions(rows.map((row) => ({
@@ -1587,7 +1726,7 @@ window.__ModuleLoader__.load({
         void (async () => {
           try {
             const next = await getJson(API + '/state')
-            if (next.ok === true) setState(next)
+            if (next.ok === true) { deskState = next; setState(next) }
             else setError('读库失败')
           } catch (err) {
             console.error('[shuzhuo] state fetch failed', err && err.message, err)
@@ -1607,18 +1746,24 @@ window.__ModuleLoader__.load({
               ? next.items.map(normalizeDraft)
               : []
             const cached = readDraftCache()
-            const serverHasText = serverItems.some((item) => !isBlankDraft(item))
-            const cacheHasText = cached !== null && cached.some((item) => !isBlankDraft(item))
-            if (serverItems.length > 0) {
-              setDrafts(serverItems)
-              setActiveId(serverItems[0].id)
+            const merged = mergeDrafts(serverItems, cached)
+            if (merged.length > 0) {
+              setDrafts(merged)
+              setActiveId(merged[0].id)
+              writeDraftCache(merged)
             }
-            // 盘上只剩空壳、本地缓存却有正文 → 说明那次没写进去，用缓存救回来并补写。
-            if (cacheHasText && !serverHasText) {
-              setDrafts(cached)
-              setActiveId(cached[0].id)
+            // 合并结果和盘上不一样（本地有更新的、或缓存里多一条）→ 补写回盘上，
+            // 别让下一次刷新又回到旧的那一份。按 id 比，不按顺序比：顺序一变不该算改动。
+            const serverById = new Map(serverItems.map((item) => [item.id, item]))
+            const changed = merged.length !== serverItems.length
+              || merged.some((item) => {
+                const row = serverById.get(item.id)
+                return row === undefined
+                  || Number(row.updatedAt ?? 0) !== Number(item.updatedAt ?? 0)
+              })
+            if (changed) {
               try {
-                await http('POST', API + '/drafts', { items: cached })
+                await http('POST', API + '/drafts', { items: merged })
               } catch { /* 补写失败就先让正文留在屏幕上 */ }
             }
           } catch (err) {

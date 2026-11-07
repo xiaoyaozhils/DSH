@@ -33,7 +33,8 @@ C:\Users\<你的用户名>\.shuzhuo\config.json
   "vault": "C:\\Users\\你\\Documents\\我的资料库",
   "stateDir": "C:\\Users\\你\\.shuzhuo\\state",
   "bridgePort": 9787,
-  "bridgeToken": "你的bridge token"
+  "bridgeToken": "你的bridge token",
+  "workdir": "C:\\Users\\你\\dsh-workspace"
 }
 ```
 
@@ -43,19 +44,24 @@ C:\Users\<你的用户名>\.shuzhuo\config.json
 | `stateDir` | 草稿和待办存哪。填个空文件夹路径就行，插件会自己建。 |
 | `bridgePort` | Whale Bridge 的端口，默认 9787，不用改。 |
 | `bridgeToken` | Whale Bridge 里设的 token，要和 Obsidian 那边一致。 |
+| `workdir` | 可选。书桌所在的工作区路径：叫 AI 看一眼时，优先发到这个目录下的会话。不填就发给最近开着的会话。 |
 
 ⚠️ Windows 路径里的 `\` 在 JSON 里要写成 `\\`，否则读不出来。
 
 保存后刷新 DSH 页面。书桌左上角显示页数了，就是配好了。
 
-也可以用环境变量代替这个文件：`SHUZHUO_VAULT`、`SHUZHUO_STATE`、`SHUZHUO_BRIDGE_PORT`、`SHUZHUO_BRIDGE_TOKEN`。
+也可以用环境变量代替这个文件：`SHUZHUO_VAULT`、`SHUZHUO_STATE`、`SHUZHUO_TODO`、`SHUZHUO_DRAFTS`、`SHUZHUO_WORKDIR`、`SHUZHUO_BRIDGE_PORT`、`SHUZHUO_BRIDGE_TOKEN`。
 
 ## 四、怎么用
 
 - **概览**：库有多少页、哪些页被引得最多、最近改了什么。
-- **牵连**：输入一个词（人名、地名、术语），看全库哪些页提到它、落在哪一节。上面的「图」是以它为中心的连线图。
+- **牵连**：输入一个词（人名、地名、术语），看全库哪些页提到它、落在哪一节。上面的「图」是以它为中心的连线图。红 = 有定义点，黄 = 深度涉及，灰 = 顺带提一句。
 - **页面**：点开任意一页，看正文、小节、有没有断链。
-- **讨论**：左边写想法，右边写正文，点「谈完了，准备入库」，AI 帮你判断该放哪、拆成几页。
+- **讨论**：左边写想法，右边写正文，只留两个框——名字、类别、该放哪，AI 到结算时先猜一份。点「谈完了，准备入库」：
+  - 先按正文拆成几片，每片可以改标题、类型、去向，勾哪片写哪片；
+  - 正文里以「## 待议」开头、或以「问：」起行的，算**问题**不算内容——不写进页面，挂在讨论区等你议完再清掉；
+  - 入库统一先进 `08-待定/00-新入库`，AI 在库里过一遍、改顺了再挪进正式分类；
+    - 结算页会扫一遍牵连（词是从正文里认的，认错了可以改那一行再重扫），告诉你这一条会牵动谁、库里有没有同名页。
 - **待办**：和资料库分开的写作待办。
 
 ## 五、常见问题
@@ -71,4 +77,4 @@ Obsidian 没开，或 Whale Bridge 插件没启用，或 `bridgePort`/`bridgeTok
 
 ## 六、隐私
 
-只读你自己的本地文件；除了 `127.0.0.1` 上的本地桥，不发任何网络请求。插件里不含任何人的数据，装上就是一个空工作台。
+只读写你自己的本地文件（写库只经 `127.0.0.1` 上的本地桥，由 Obsidian 那边的 Whale Bridge 落盘），不发任何对外的网络请求。插件里不含任何人的数据，装上就是一个空工作台。

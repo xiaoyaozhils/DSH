@@ -2,14 +2,15 @@
  * 书桌 — host half.
  *
  * 资料库在 DSH 工作区之外，浏览器自己读不到，所以由后端读取。
- * 所以库的读取全在宿主这边做，只通过 /api/shuzhuo 暴露三样东西：
+ * 所以库的读取全在宿主这边做，只通过 /api/shuzhuo 暴露：
  *   概览（有多少页、哪些是枢纽、最近动了什么）
  *   牵连（一个术语一旦被改动，全库哪些页会被波及）
  *   单个页面（正文、出链、入链、小节）
+ *   讨论台的拆分 / 认词 / 待议抽取
  *
- * 不写库。写库仍然只走 Obsidian 桥，这里纯读。
+ * 写库不直接碰文件：一律走 Obsidian 侧的 Whale Bridge（本地 HTTP），由 Obsidian 落盘。
  */
-import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join, relative, sep, resolve, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -19,7 +20,7 @@ let pluginCtx = null
 
 /**
  * 配置：优先环境变量，其次 ~/.shuzhuo/config.json，最后内置默认。
- * config.json 形状：{ "vault": "...", "stateDir": "...", "bridgePort": 9787, "bridgeToken": "..." }
+ * config.json 形状：{ "vault": "...", "stateDir": "...", "bridgePort": 9787, "bridgeToken": "...", "workdir": "..." }
  * 包里不写死任何人的路径——没配 vault 就明确报错，不静默返回空库。
  */
 const CONFIG_FILE = process.env.SHUZHUO_CONFIG || join(homedir(), '.shuzhuo', 'config.json')
@@ -35,6 +36,8 @@ function loadConfig() {
 const config = loadConfig()
 const STATE_DIR = process.env.SHUZHUO_STATE || config.stateDir || join(homedir(), '.shuzhuo')
 const VAULT = process.env.SHUZHUO_VAULT || config.vault || ''
+/** 书桌所在的工作区：叫助手时会优先找这个目录下的会话。留空就按最近的会话走。 */
+const WORKDIR = process.env.SHUZHUO_WORKDIR || config.workdir || ''
 const TODO_FILE = process.env.SHUZHUO_TODO || join(STATE_DIR, 'todo.json')
 const DRAFTS_FILE = process.env.SHUZHUO_DRAFTS || join(STATE_DIR, 'drafts.json')
 
@@ -159,7 +162,7 @@ function readAll() {
   return docs
 }
 
-/** 双链是按名字解析的：[[02-故事/13-折枝]] 和 [[13-折枝]] 指的是同一页。 */
+/** 双链是按名字解析的：[[02-故事/13-某角色]] 和 [[13-某角色]] 指的是同一页。 */
 function buildIndex(docs) {
   const byName = new Map()
   const byPath = new Map()
@@ -222,6 +225,8 @@ export function overview() {
     ok: true,
     at: Date.now(),
     vault: VAULT,
+    workdir: WORKDIR,
+    paths: { vault: VAULT, state: STATE_DIR, drafts: DRAFTS_FILE, todo: TODO_FILE },
     stats: {
       pages: docs.length,
       chars,
@@ -343,6 +348,56 @@ export function probe(terms, options = {}) {
     },
     items,
   }
+}
+
+// ── 扫描词 ────────────────────────────────────────────────────────────────
+//
+// 2026-11-07：以前只拿「标题 + 和什么有关」当扫描词。标题一旦是猜的（「下面只」
+// 这种），牵连图就一个点都画不出来。现在从正文里认词：库里已有的页名、
+// 书名号/引号里点名的词，都比句子里随便一个短语靠谱。
+
+const TERM_STOP = new Set(('一个 两个 这些 那些 这个 那个 这样 那样 这种 那种 一些 大概 具体 细节 '
+  + '方面 没有 什么 怎么 就是 但是 不过 因为 所以 如果 然后 之后 之前 现在 后来 最后 自己 我们 你们 '
+  + '他们 她们 东西 时候 地方 事情 问题 可以 需要 一定 肯定 其实 已经 还是 只是 之类 等等 一下 一样 '
+  + '一边 同时 其中 此外 因此 而且 并且 虽然 即使 只要 只有 不要 不能 不会 不是 还有 另外 其实')
+  .split(/\s+/).filter((word) => word !== ''))
+
+export function termsOf(input) {
+  const text = String(input?.text ?? '')
+  const title = String(input?.title ?? '').trim()
+  const related = String(input?.related ?? '')
+  const found = new Map()
+  const bump = (term, weight) => {
+    if (term.length < 2 || term.length > 14) return
+    if (TERM_STOP.has(term)) return
+    found.set(term, (found.get(term) ?? 0) + weight)
+  }
+
+  // 库里已有的页名：正文里出现，就是这一条真正牵着的东西。
+  const names = [...new Set(readAll().map((doc) => stripNum(doc.name)))]
+    .filter((name) => name.length >= 2 && name.length <= 14)
+  for (const name of names) {
+    const count = text.split(name).length - 1
+    if (count > 0) bump(name, 10 + Math.min(count, 5) * 2 + name.length)
+  }
+  // 书名号、引号里点名的词：作者自己划了重点。
+  for (const raw of text.match(/《[^》]{2,20}》/g) ?? []) bump(raw.slice(1, -1).trim(), 8)
+  for (const raw of text.match(/[「『“"][^」』”"]{2,14}[」』”"]/g) ?? []) bump(raw.slice(1, -1).trim(), 6)
+
+  const out = [...found.entries()].sort((a, b) => b[1] - a[1]).map(([term]) => term)
+  // 标题自己也算一个词（作者手填的标题通常是真名）；「和什么有关」里的短语补在后面，
+  // 但只收短、像专名的那些——「一个资格者的人物设定想法」是描述，不是术语。
+  const extras = []
+  for (const extra of [title, ...related.split(/[，,、;；:：。！？\s]+/)]) {
+    const value = String(extra ?? '').trim()
+    if (value === '' || value.length > 10) continue
+    if (TERM_STOP.has(value)) continue
+    // 2026-11-07：标题也要过一遍名字体检——标题可能是书桌自己猜的（如「下面只」），
+    // 直接当术语会把整张牵连图带偏。
+    if (!looksLikeName(value) && !names.includes(value)) continue
+    if (!extras.includes(value) && !out.includes(value)) extras.push(value)
+  }
+  return { ok: true, terms: [...extras, ...out].slice(0, 8) }
 }
 
 // ── 单页 ──────────────────────────────────────────────────────────────────
@@ -531,6 +586,9 @@ const TYPE_TOP = {
   写作: '05-写作',
 }
 
+/** 入库第一站：待定箱。助手在库里过一遍、改顺了，再手动挪进正式分类。 */
+const INBOX_DIR = '08-待定/00-新入库'
+
 const TYPE_CUES = [
   ['人物', /人物|角色|名叫|叫作|叫做|出身|性格|外貌|身世|她是|他是/g],
   ['事件', /事件|这一章|这一节|这一卷|剧情|情节|起因|经过|结果|结局|战争|之后|来到|离开|发生/g],
@@ -603,12 +661,26 @@ function guessType(text, fallback) {
   return scores[0].type
 }
 
-function guessName(text, draft) {
-  const firstLine = String(text ?? '').trim().split(/\n+/)[0] ?? ''
-  const asName = /^([^\s，。、；：！？]{1,14})(?:是|指|即|就是|叫作|叫做|称为|名叫)/.exec(firstLine)
-  if (asName !== null) return asName[1]
+/** 名字长得像不像个专名：虚词开头、带助词、带标点的一律不认（散文里的「这两个人是……」不是名字）。 */
+const NAME_HEAD = /^(这|那|下|上|以|不|很|然|并|但|而|所|因|对|从|到|在|和|与|及|其|此|该|每|各|两|几|数|多|少|全|都|又|再|更|最|太|还|就|才|只|也|却|便|则|若|如|虽|即|且|或|可|能|要|会|把|被|给|让|使|为|着|了|过|是|有|没|无|说|讲|写|像|成|做|用|让|一)/
+const NAME_BAD = /[的了着过嘛呢吧啊呀哦是有在把被给让使为着吗\s，。、；：！？,.;:!?"'“”‘’「」『』《》（）()\[\]]/
+
+function looksLikeName(value) {
+  const text = String(value ?? '').trim()
+  if (text.length < 2 || text.length > 14) return false
+  if (NAME_HEAD.test(text) || NAME_BAD.test(text)) return false
+  return true
+}
+
+/** 只在有旁证时才认名字：引号里点名，或者全文里反复出现（真专名总不止出现一次）。 */
+function guessName(text, whole) {
+  const body = String(text ?? '').trim()
+  const all = String(whole ?? body)
+  const firstLine = body.split(/\n+/)[0] ?? ''
   const quoted = /[「『"“]([^」』"”]{2,14})[」』"”]/.exec(firstLine)
-  if (quoted !== null) return quoted[1]
+  if (quoted !== null && looksLikeName(quoted[1])) return quoted[1]
+  const asName = /^([^\s，。、；：！？]{2,14})(?:是|指|即|就是|叫作|叫做|称为|名叫)/.exec(firstLine)
+  if (asName !== null && looksLikeName(asName[1]) && all.split(asName[1]).length - 1 >= 2) return asName[1]
   return ''
 }
 
@@ -627,30 +699,45 @@ function bulletItems(block) {
   return items
 }
 
-/** 长段落里连着几句「X 是……」，按句拆成几片。 */
+/** 长段落里连着几句「X 是……」，按句拆成几片。
+ *  2026-11-07 停用：散文里「这两个人是……」「不过这个剑修不是……」都会被当成定义句，
+ *  一条草稿被剁成十几片、标题全是半句话。拆片只认作者自己写的结构（小节、标签、清单）。 */
 function defGroups(block) {
-  if (block.length < 160) return []
-  const sentences = splitSentences(block)
-  if (sentences.length < 3) return []
-  const groups = []
-  let current = []
-  for (const sentence of sentences) {
-    const name = guessName(sentence, null)
-    if (name !== '' && current.length > 0) {
-      groups.push({ title: guessName(current[0], null), text: current.join('') })
-      current = [sentence]
-    } else {
-      current.push(sentence)
-    }
-  }
-  if (current.length > 0) groups.push({ title: guessName(current[0], null), text: current.join('') })
-  return groups.length >= 2 ? groups : []
+  return []
 }
 
 function cutDraft(draft) {
-  const raw = draft.body.replace(/\r\n?/g, '\n').trim()
+  let raw = draft.body.replace(/\r\n?/g, '\n').trim()
   const parts = []
-  if (raw === '') return parts
+  // 作者把大问题写在草稿最后面（省上下文）。标了记的那些是「要议的」，不是正文：
+  // 抽出来单独回给讨论区，免得混进页面里入库存档。2026-11-07 作者定的流程。
+  const issues = []
+  const ISSUE_HEAD = /^#{1,6}\s*(待议|待定问题|待讨论|问题|疑问|存疑)\s*$/
+  const lines0 = raw.split('\n')
+  const issueAt = lines0.findIndex((line) => ISSUE_HEAD.test(line.trim()))
+  if (issueAt !== -1) {
+    // 只吃掉这个小节：后面再出现别的标题，那是正文，得留下。
+    const nextHead = lines0.findIndex((line, i) => i > issueAt && /^#{1,6}\s+/.test(line.trim()))
+    const end = nextHead === -1 ? lines0.length : nextHead
+    const tail = lines0.slice(issueAt + 1, end).join('\n').trim()
+    if (tail !== '') {
+      issues.push(...tail.split(/\n+/)
+        .map((line) => line.replace(/^[-*+]\s*/, '').replace(/^(?:问题|问)[:：]\s*/, '').trim())
+        .filter((line) => line !== ''))
+    }
+    raw = [...lines0.slice(0, issueAt), ...lines0.slice(end)].join('\n').trim()
+  }
+  raw = raw
+    .split('\n')
+    .filter((line) => {
+      const q = /^(?:问题|问)[:：]\s*(.+)$/.exec(line.trim())
+      if (q === null) return true
+      issues.push(q[1].trim())
+      return false
+    })
+    .join('\n')
+    .trim()
+  if (raw === '') return { parts, issues }
 
   const lines = raw.split('\n')
   const hasSection = lines.some((line) => /^##\s+/.test(line))
@@ -675,23 +762,31 @@ function cutDraft(draft) {
     const leadText = lead.join('\n').trim()
     if (leadText !== '') parts.unshift({ title: draft.title.trim(), type: '', text: leadText })
   } else {
+    // 没有小节：只认作者自己写的结构——「人物：…」「设定：…」这种标签段，
+    // 或者「- 名字：一句话」这种清单。剩下的散文整篇算一片，
+    // 宁可少拆也不猜：猜出来的词多半是半句话，入库就变成一堆废页。
     const blocks = raw.split(/\n{2,}/).map((block) => block.trim()).filter((block) => block !== '')
+    const loose = []
     for (const block of blocks) {
       const label = LABEL_RE.exec(block)
-      const type = label === null ? '' : label[1]
-      const body = label === null ? block : block.slice(label[0].length).trim()
-      if (body === '') continue
-      const items = bulletItems(body)
+      if (label !== null) {
+        const body = block.slice(label[0].length).trim()
+        if (body !== '') {
+          parts.push({ title: '', type: label[1], text: body })
+          continue
+        }
+      }
+      const items = bulletItems(block)
       if (items.length >= 2) {
-        for (const item of items) parts.push({ title: item.title, type, text: item.text })
+        for (const item of items) parts.push({ title: item.title, type: '', text: item.text })
         continue
       }
-      const groups = defGroups(body)
-      if (groups.length >= 2) {
-        for (const group of groups) parts.push({ title: group.title, type, text: group.text })
-        continue
-      }
-      parts.push({ title: '', type, text: body })
+      loose.push(block)
+    }
+    if (loose.length > 0) {
+      const text = loose.join('\n\n')
+      if (parts.length === 0) parts.push({ title: '', type: '', text })
+      else parts.unshift({ title: '', type: '', text })
     }
   }
 
@@ -707,7 +802,7 @@ function cutDraft(draft) {
     }
     merged.push({ title: part.title ?? '', type: part.type ?? '', text })
   }
-  return merged
+  return { parts: merged, issues }
 }
 
 /** 给一片找目录：先看类型，再用「目录名 + 目录里已有的页名」跟正文对词。 */
@@ -715,9 +810,10 @@ function routeDir(text, title, type, dirs) {
   const top = TYPE_TOP[type] ?? '04-设定'
   let best = { dir: top, score: 0 }
   for (const dir of dirs) {
-    if (!CONTENT_TOPS.includes(dir.path.split('/')[0])) continue
-    // 同一棵子树里，越具体越优先：子目录比顶层多 1 分，再由页名命中定胜负。
-    let score = dir.path === top ? 3 : (dir.path.startsWith(top + '/') ? 4 : 0)
+    // 类型已经定了树，就只在这棵树里挑叶：正文里提了一堆世界术语，
+    // 不代表这一条人物该塞进 01-世界。
+    if (dir.path !== top && !dir.path.startsWith(top + '/')) continue
+    let score = dir.path === top ? 3 : 4
     for (const token of stripNum(dir.name).split(/[与和、,，\s]+/)) {
       if (token.length >= 2 && (text.includes(token) || title.includes(token))) score += 2
     }
@@ -829,26 +925,39 @@ export function splitDraft(input) {
     ...dir,
     pages: docs.filter((doc) => doc.dir === dir.path).map((doc) => stripNum(doc.name)),
   }))
-  const raw = cutDraft(draft)
+  // 入库先进待定箱，助手过一遍再挪到正式分类（2026-11-07 作者定的第四版→第五版流程）。
+  if (!dirs.some((dir) => dir.path === INBOX_DIR)) {
+    dirs.unshift({ path: INBOX_DIR, name: '新入库', pages: [] })
+  }
+  const cut = cutDraft(draft)
+  const raw = cut.parts
+  const issues = cut.issues
   const parts = []
   const used = new Map()
   for (const item of raw) {
     const text = item.text.trim()
     if (text === '') continue
     const type = item.type !== '' ? item.type : guessType(text, draft.category)
-    const title = safeTitle(item.title) || safeTitle(guessName(text, draft)) || safeTitle(draft.title) || '（待命名）'
-    const dir = routeDir(text, title, type, dirs)
+    const guessed = safeTitle(guessName(text, draft.body))
+    const title = safeTitle(item.title)
+      || guessed
+      || (raw.length <= 1 ? safeTitle(draft.title) : '')
+      || safeTitle(draft.title + '·' + type)
+      || '（待命名）'
+    // 默认进待定箱；建议的正式分类留着给结算页那个下拉当提示（routeDir 仍然算）。
+    const suggested = routeDir(text, title, type, dirs)
+    const dir = INBOX_DIR
     const rel = dir + '/' + title + '.md'
     const previous = used.get(rel)
     if (previous !== undefined) {
       previous.body += '\n\n' + text
       continue
     }
-    const entry = { title, type, dir, rel, body: text, chars: text.length }
+    const entry = { title, type, dir, suggested, rel, body: text, chars: text.length }
     used.set(rel, entry)
     parts.push(entry)
   }
-  return { ok: true, parts, dirs, today: new Date().toISOString().slice(0, 10) }
+  return { ok: true, parts, dirs, issues, today: new Date().toISOString().slice(0, 10) }
 }
 
 /** 写多页：目标已存在就追加一节，不存在才新建。逐页回报结果。 */
@@ -985,6 +1094,15 @@ async function handle(request, response, url) {
     case '/probe':
       sendJson(response, 200, probe(terms, { archive: url.searchParams.get('archive') === '1' }))
       return
+    case '/terms': {
+      if (method === 'POST') {
+        const body = await readBody(request)
+        sendJson(response, 200, termsOf(body))
+        return
+      }
+      sendJson(response, 200, termsOf({ text: url.searchParams.get('text') ?? '' }))
+      return
+    }
     case '/page': {
       const rel = url.searchParams.get('rel') ?? ''
       const abs = insideVault(rel)
@@ -1066,15 +1184,18 @@ async function callWhale(body) {
     return { ok: false, error: '拿不到 session 服务，DSH 这边可能还没起来' }
   }
   const signal = new AbortController().signal
-  const WORKDIR = 'C:\\Users\\20868\\dsh-workspace'
   let rows = []
   try {
     const listed = await controller.list({}, signal)
     rows = (listed?.items ?? []).filter((item) =>
       item.origin !== 'subagent' &&
       item.parentSessionId === undefined &&
-      typeof item.cwd === 'string' &&
-      item.cwd.toLowerCase() === WORKDIR.toLowerCase())
+      !item.blank)
+    // 配了 workdir 就只在这个工作区里找；没配就退到最近的那个会话。
+    if (WORKDIR !== '') {
+      rows = rows.filter((item) =>
+        typeof item.cwd === 'string' && item.cwd.toLowerCase() === WORKDIR.toLowerCase())
+    }
     rows.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
   } catch (error) {
     return { ok: false, error: '列会话失败：' + String(error?.message ?? error) }
@@ -1083,7 +1204,7 @@ async function callWhale(body) {
   let created = false
   try {
     if (sessionId === null) {
-      const made = await controller.create({ cwd: WORKDIR })
+      const made = await controller.create(WORKDIR === '' ? {} : { cwd: WORKDIR })
       sessionId = made.sessionId
       created = true
     }
@@ -1106,6 +1227,7 @@ async function callWhale(body) {
 
 export function apply(ctx) {
   pluginCtx = ctx
+
   const route = {
     kind: 'prefix',
     path: API,
