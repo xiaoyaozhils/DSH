@@ -997,28 +997,18 @@ window.__ModuleLoader__.load({
     // 讨论的时候不打扰：这一页不查牵连、不弹提示，只写字。
     // 点「准备入库」才结算——那时候才去扫全库，看这一条会跟谁打架。
     // 分类不再写死目录：库自己长成什么样，书桌就去问 host 要树（/split 会带回来）。
-    // 这里只留「类型 → 顶层」的兜底，免得目录树换了新花样时没地方落。
-    const TYPE_TOP = {
-      人物: '03-人物',
-      事件: '02-故事',
-      故事: '02-故事',
-      世界: '01-世界',
-      设定: '04-设定',
-      素材: '06-素材',
-      写作: '05-写作',
-    }
     const TYPE_OPTIONS = ['人物', '事件', '设定', '世界', '素材', '写作', '故事']
     /** 入库的落脚点：先进待定箱，助手过一遍再挪进正式分类。 */
     const INBOX_DIR = '08-待定/00-新入库'
 
     const STATUS_TEXT = { draft: '讨论中', settled: '待入库', filed: '已入库' }
 
-    /** 老存档里没有 related 这些字段，统一补齐，免得读的时候到处判空。 */
     /** 字符串数组的兜底：盘上可能是 undefined、也可能被手改坏。 */
     function asStringList(value) {
       return Array.isArray(value) ? value.filter((one) => typeof one === 'string' && one.trim() !== '') : []
     }
 
+    /** 老存档里没有 related、issues 这些字段，统一补齐，免得读的时候到处判空。 */
     function normalizeDraft(item) {
       const text = (value) => (typeof value === 'string' ? value : '')
       return {
